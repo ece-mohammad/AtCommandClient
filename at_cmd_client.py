@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from typing import Union, List
+
 import serial
 
 
@@ -132,7 +133,8 @@ class AtCommandClient(object):
         self.response_buffer: queue.Queue = queue.Queue(10)
         self.last_cmd: Union[AtCommand, None] = None
         self.last_response: Union[AtCommandResponse, None] = None
-        self.events = dict()
+        self.event_lock = threading.RLock()
+        self.events: List[AtEvent] = list()
         self.running = threading.Event()
         self.cmd_idle = threading.Event()
         self.client_thread = threading.Thread(target=self._run, daemon=False)
@@ -193,7 +195,8 @@ class AtCommandClient(object):
         :return:
         :rtype:
         """
-        self.events[event.name] = event
+        with self.event_lock:
+            self.events.append(event)
 
     def start(self) -> None:
         """
@@ -221,7 +224,6 @@ class AtCommandClient(object):
         :return:
         :rtype:
         """
-
         # response buffer
         response_buffer: str = str()
 
@@ -234,7 +236,27 @@ class AtCommandClient(object):
             # read line from uart
             response_buffer += self.huart.readline().decode("ascii")
 
-            # 
+            # get events lock
+            with self.event_lock:
+
+                # loop over a copy of added events
+                for event in self.events[:]:
+                    match = self.match_string(
+                        event.string,
+                        response_buffer,
+                        event.match_type
+                    )
+
+                    # check for an event match
+                    if match:
+                        event.callback(event, event.string, match)
+                        response_buffer = str()
+
+                        # remove one-time events
+                        if event.event_type == AtEventType.OneTime:
+                            self.events.remove(event)
+
+                        break
 
             # if no command response is pending, continue
             if self.cmd_idle.is_set():
@@ -271,7 +293,7 @@ class AtCommandClient(object):
                     self.last_cmd,
                     AtCommandStatus.Success,
                     self.last_response,
-                    response_buffer
+                    match
                 )
 
             # check on of error responses string was found in response string
@@ -289,7 +311,7 @@ class AtCommandClient(object):
                             self.last_cmd,
                             AtCommandStatus.Error,
                             self.last_response,
-                            response_buffer
+                            match
                         )
                         break
 
@@ -308,7 +330,7 @@ class AtCommandClient(object):
                             self.last_cmd,
                             AtCommandStatus.Success,
                             self.last_response,
-                            response_buffer
+                            match
                         )
                         break
 
@@ -318,17 +340,6 @@ class AtCommandClient(object):
                 response_buffer = str()
 
             time.sleep(0.1)
-
-    def on_event(self, event: AtEvent, event_string: str) -> None:
-        """
-        :param event:
-        :type event:
-        :param event_string:
-        :type event_string:
-        :return:
-        :rtype:
-        """
-        pass
 
     def on_response(self, cmd: AtCommand,
                     status: AtCommandStatus,
@@ -383,6 +394,12 @@ if __name__ == '__main__':
     import sys
 
     log.basicConfig(stream=sys.stdout)
+
+    def is_ready(event: AtEvent, response: AtCommandResponse, string: str) -> None:
+        print(f"Ready callback. Device is ready: {string}")
+
+    def time_update(event: AtEvent, response: AtCommandResponse, string: str) -> None:
+        print(f"Device Date Time Update Callback. Date Time: {string}")
 
     COM_PORT = "COM6"
 
@@ -464,6 +481,23 @@ if __name__ == '__main__':
         timeout=3
     )
 
+    # ready event
+    ready_event = AtEvent(
+        name="Ready",
+        string="READY\r\n",
+        matching=AtStringMatchingRule.Exact,
+        callback=is_ready
+    )
+
+    # ready event
+    dt_update = AtEvent(
+        name="Date Time Update",
+        string="\\+CCLK:\\s*.*\r\n",
+        event_type=AtEventType.Reoccurring,
+        matching=AtStringMatchingRule.Regex,
+        callback=time_update
+    )
+
     # # print responses
     # print(ok_rsp)
     # print(dt_rsp)
@@ -490,10 +524,12 @@ if __name__ == '__main__':
     got_response = threading.Event()
 
 
-    def on_response(cmd: AtCommand,
-                    status: AtCommandStatus,
-                    response: Union[AtCommandResponse, None],
-                    response_string: Union[str, None]):
+    def on_response(
+        cmd: AtCommand,
+        status: AtCommandStatus,
+        response: Union[AtCommandResponse, None],
+        response_string: Union[str, None]
+    ) -> None:
         global got_response
         got_response.set()
         string = f"Callback for Cmd {cmd.name} status: {status} "
@@ -507,10 +543,17 @@ if __name__ == '__main__':
         print(f"{string}\n")
 
 
+    def on_event(event: AtEvent, string: str, response: str) -> None:
+        print(f"Received event: {event.name}, string: {string}, response: {response}")
+
+
     with serial.Serial("COM6", baudrate=115200, timeout=0.1) as ser:
         cl = AtCommandClient('testClient', ser)
         cl.on_response = on_response
         cl.start()
+
+        cl.add_event(ready_event)
+        cl.add_event(dt_update)
 
         # send commands
         got_response.clear()
@@ -548,5 +591,10 @@ if __name__ == '__main__':
         got_response.wait()
         print(cl)
         print("-----------------------------")
-
+        
+        # send events & close
+        print("Waiting for events. Press q to close. ")
+        close = ""
+        while close != 'q':
+            close = input().strip().lower()
         cl.stop()
