@@ -1,0 +1,4 @@
+1. Events
+2. load AT commands from an external file template
+3. Unit Testing
+4. Test suite
