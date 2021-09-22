@@ -246,7 +246,7 @@ class AtCommandClient(object):
     threads at the same time
     :attr running: a flag that indicates if the client is running or not,
     resetting the flag terminates the client's thread
-    :attr pending_response: a flag that indicates if the client is waiting for
+    :attr client_ready: a flag that indicates if the client is waiting for
     a response
     :attr client_thread: a thread to run the clients `AtCommandClient._run`
     function, that handles responses and events
@@ -275,10 +275,10 @@ class AtCommandClient(object):
         self.client_thread = threading.Thread(target=self._run, daemon=False)
         self.event_lock = threading.RLock()
         self.running = threading.Event()
-        self.pending_response = threading.Event()
+        self.client_ready = threading.Event()
 
-        # set pending_response flag
-        self.pending_response.set()
+        # set client ready flag
+        self.client_ready.set()
 
     def __str__(self) -> str:
         string = f"Module: {self.name}\n"
@@ -304,8 +304,8 @@ class AtCommandClient(object):
         :rtype: None
         """
 
-        # check if client is pending_response
-        self.pending_response.wait()
+        # check if client is client_ready
+        self.client_ready.wait()
 
         self.logger.debug(f"Sending cmd {cmd.name}: {cmd.cmd.strip()}")
 
@@ -327,8 +327,8 @@ class AtCommandClient(object):
         # command send time
         cmd.send_time = time.time()
 
-        # clear pending_response
-        self.pending_response.clear()
+        # clear client_ready
+        self.client_ready.clear()
 
     def add_event(self, event: AtEvent) -> None:
         """
@@ -363,7 +363,7 @@ class AtCommandClient(object):
         :rtype: None
         """
         self.running.set()
-        self.pending_response.clear()
+        self.client_ready.set()
         self.client_thread.start()
 
     def stop(self) -> None:
@@ -373,7 +373,7 @@ class AtCommandClient(object):
         :rtype: None
         """
         self.running.clear()
-        self.pending_response.clear()
+        self.client_ready.clear()
 
         while self.client_thread.is_alive():
             time.sleep(0.1)
@@ -463,7 +463,7 @@ class AtCommandClient(object):
                         break
 
             # if no command response is pending, continue
-            if self.pending_response.is_set():
+            if self.client_ready.is_set():
                 continue
 
             # calculate command timeout
@@ -481,7 +481,7 @@ class AtCommandClient(object):
                     None
                 )
 
-                self.pending_response.set()
+                self.client_ready.set()
                 continue
 
             # check success response string was found in response string
@@ -522,10 +522,10 @@ class AtCommandClient(object):
                         )
                         break
 
-            # reset response buffer & clear pending_response
+            # reset response buffer & clear client_ready
             if match:
                 response_buffer = str()
-                self.pending_response.set()
+                self.client_ready.set()
 
             time.sleep(0.1)
 
