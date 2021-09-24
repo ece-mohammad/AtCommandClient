@@ -39,7 +39,7 @@ import re
 import threading
 import time
 from abc import ABCMeta
-from typing import Callable, List, Union
+from typing import Callable, List, Union, Optional
 
 import serial
 
@@ -201,8 +201,8 @@ class AtCommand(object):
 
     def __init__(self, name: str,
                  cmd: Union[str, bytes],
-                 success_response: Union[AtCommandResponse, None],
-                 error_response: Union[List[AtCommandResponse], None] = None,
+                 success_response: Optional[AtCommandResponse],
+                 error_response: Optional[List[AtCommandResponse]] = None,
                  timeout: float = 0) -> None:
         self.name = name
         self.cmd = cmd
@@ -268,9 +268,9 @@ class AtCommandClient(object):
         self.name = name
         self.huart = uart_handle
         self.logger = log.getLogger(f"{self.name}({self.__class__.__name__})")
-        self.last_cmd: Union[AtCommand, None] = None
-        self.last_response: Union[AtCommandResponse, None] = None
-        self.last_status: Union[AtCommandStatus, None] = None
+        self.last_cmd: Optional[AtCommand] = None
+        self.last_response: Optional[AtCommandResponse] = None
+        self.last_status: Optional[AtCommandStatus] = None
         self.events: List[AtEvent] = list()
         self.client_thread = threading.Thread(target=self._run, daemon=False)
         self.event_lock = threading.RLock()
@@ -531,8 +531,8 @@ class AtCommandClient(object):
 
     def on_response(self, cmd: AtCommand,
                     status: AtCommandStatus,
-                    response: Union[AtCommandResponse, None],
-                    response_string: Union[str, None]
+                    response: Optional[AtCommandResponse],
+                    response_string: Optional[str]
                     ) -> None:
         """
         Response callback, called when a command's response is received, or
@@ -547,10 +547,10 @@ class AtCommandClient(object):
         :type status: AtCommandStatus
         :param response: Received command response (error or success), or None
         if the command timed out
-        :type response: Union[AtCommandResponse, None]
+        :type response: Optional[AtCommandResponse]
         :param response_string: the response buffer, containing the command's
         response string (success or error), or None if the command timed out
-        :type response_string: Union[str, None]
+        :type response_string: Optional[str]
         :return: None
         :rtype: None
         """
@@ -743,8 +743,8 @@ if __name__ == '__main__':
     def on_response(
         cmd: AtCommand,
         status: AtCommandStatus,
-        response: Union[AtCommandResponse, None],
-        response_string: Union[str, None]
+        response: Optional[AtCommandResponse],
+        response_string: Optional[str]
     ) -> None:
         global got_response
         got_response.set()
