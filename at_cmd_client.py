@@ -130,7 +130,7 @@ class AtString(metaclass=ABCMeta):
 
             # check if there is a string that matches pattern regex
             # string in the given string
-            match = re.findall(pattern, string)
+            match = re.findall(pattern, string, re.DOTALL)
             if match:
                 return match[0]
             else:
@@ -453,7 +453,7 @@ class AtCommandClient(object):
 
                     # check for an event match
                     if match:
-                        event.callback(event.string, response_buffer)
+                        event.callback(event.string, match)
                         response_buffer = str()
 
                         # remove one-time events
@@ -499,7 +499,7 @@ class AtCommandClient(object):
                     self.last_cmd,
                     self.last_status,
                     self.last_response,
-                    response_buffer
+                    match
                 )
 
             # check on of error responses string was found in response string
@@ -518,7 +518,7 @@ class AtCommandClient(object):
                             self.last_cmd,
                             self.last_status,
                             self.last_response,
-                            response_buffer
+                            match
                         )
                         break
 
@@ -580,24 +580,31 @@ if __name__ == '__main__':
         matching=AtStringMatchingRule.Exact
     )
 
+    # multiline command response
+    multiline_response = AtCommandResponse(
+        name="Multiline Response",
+        string="\\+ML.*OK\r\n",
+        matching=AtStringMatchingRule.Regex
+    )
+
     # date send_time response
     dt_rsp = AtCommandResponse(
         name="Date Time",
-        string="\\+CCLK=\\s*.*\r\n",
+        string="\\+CCLK=.*OK\r\n",
         matching=AtStringMatchingRule.Regex
     )
 
     # cme error
     cme_error = AtCommandResponse(
         name="CME Error",
-        string="\\+CME ERROR=\\d+\r\n",
+        string="\\+CME ERROR:\\s*\\d+\r\n",
         matching=AtStringMatchingRule.Regex
     )
 
     # cms error
     cms_error = AtCommandResponse(
         name="CMS Error",
-        string="\\+CMS ERROR=\\d+\r\n",
+        string="\\+CMS ERROR:\\s*\\d+\r\n",
         matching=AtStringMatchingRule.Regex
     )
 
@@ -655,19 +662,19 @@ if __name__ == '__main__':
         timeout=3
     )
 
-    # date-time command
-    at_dt = AtCommand(
-        name="AT Date Time",
-        cmd="AT+CCLK?\r\n",
-        success_response=ok_rsp,
-        timeout=3
-    )
-
     # multiline command
     at_multiline = AtCommand(
         name="AT Multiline",
         cmd="AT+ML?\r\n",
-        success_response=ok_rsp,
+        success_response=multiline_response,
+        timeout=3
+    )
+
+    # date-time command
+    at_dt = AtCommand(
+        name="AT Date Time",
+        cmd="AT+CCLK?\r\n",
+        success_response=dt_rsp,
         timeout=3
     )
 
@@ -688,7 +695,7 @@ if __name__ == '__main__':
         timeout=3
     )
 
-    # prompt command
+    # prompt error command
     at_prompt_err = AtCommand(
         name="Prompt Error",
         cmd="AT+CIPSEND=0\r\n",
@@ -714,28 +721,28 @@ if __name__ == '__main__':
         callback=time_update
     )
 
-    # # print responses
-    # print(ok_rsp)
-    # print(dt_rsp)
-    # print(cme_error)
-    # print(cms_error)
-    # print("-----------------------------")
-    #
-    # # print commands
-    # print(at_check)
-    # print("-----------------------------")
-    #
-    # print(at_cme)
-    # print("-----------------------------")
-    #
-    # print(at_cms)
-    # print("-----------------------------")
-    #
-    # print(at_dt)
-    # print("-----------------------------")
-    #
-    # print(at_timeout)
-    # print("-----------------------------")
+    # print responses
+    print(ok_rsp)
+    print(dt_rsp)
+    print(cme_error)
+    print(cms_error)
+    print("-----------------------------")
+
+    # print commands
+    print(at_check)
+    print("-----------------------------")
+
+    print(at_cme)
+    print("-----------------------------")
+
+    print(at_cms)
+    print("-----------------------------")
+
+    print(at_dt)
+    print("-----------------------------")
+
+    print(at_timeout)
+    print("-----------------------------")
 
     got_response = threading.Event()
 
@@ -791,13 +798,13 @@ if __name__ == '__main__':
         print("-----------------------------")
 
         got_response.clear()
-        cl.send_cmd(at_dt)
+        cl.send_cmd(at_multiline)
         got_response.wait()
         print(cl)
         print("-----------------------------")
 
         got_response.clear()
-        cl.send_cmd(at_multiline)
+        cl.send_cmd(at_dt)
         got_response.wait()
         print(cl)
         print("-----------------------------")

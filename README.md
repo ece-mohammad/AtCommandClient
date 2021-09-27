@@ -556,13 +556,13 @@ default value is `None`, and is set to `None` when the command times out.
 - `events`: A list of registered events
 
 - `running`: A flag that is set to keep the AtCommandClient's thread running. 
-Default value is clear.
+Default value is reset.
 
-- `cmd_idle`: A flag that is set when the client is not waiting for any 
-response, but can be waiting for events. Default value is clear.
+- `client_ready`: A flag that is set when the client is not waiting for any 
+response, but can be waiting for events. Default value is reset.
 
 - `client_thread`: The thread in which the client reads incoming bytes from 
-serial port, and 
+serial port, and handles incoming responses and events
 
 <a id="methods-1"></a>
 #### Methods

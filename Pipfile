@@ -7,6 +7,7 @@ name = "pypi"
 pyserial = "*"
 
 [dev-packages]
+pyYAML = "*"
 
 [requires]
 python_version = "3.7"
