@@ -373,10 +373,15 @@ class AtCommandClient(object):
         :rtype: None
         """
         self.running.clear()
-        self.client_ready.clear()
 
         while self.client_thread.is_alive():
             time.sleep(0.1)
+
+        # issue #11
+        # moved after the thread closes, as clearing the event after running event, sometimes happens while the client's
+        # thread has checked running event, but has not yet checked the client_ready event, leading to re-processing
+        # of the last command
+        self.client_ready.clear()
 
     def _run(self) -> None:
         """
