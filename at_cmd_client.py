@@ -39,7 +39,7 @@ import re
 import threading
 import time
 from abc import ABCMeta
-from typing import Callable, List, Union, Optional
+from typing import Callable, List, Optional, Union
 
 import serial
 
@@ -83,8 +83,7 @@ class AtEventType(enum.Enum):
 
 
 class AtString(metaclass=ABCMeta):
-    """Generic AT command named string, describes the string pattern and its
-    matching rule
+    """Generic AT command named string, describes the string pattern and its matching rule
 
     :attr name: String name, used to identify the string.
                 Can be an empty string, though not recommended
@@ -145,8 +144,7 @@ class AtString(metaclass=ABCMeta):
 
 
 class AtCommandResponse(AtString):
-    """AT Response, A string that is sent by AT modem/device in response
-    to an AT command.
+    """AT Response, A string that is sent by AT modem/device in response to an AT command.
 
     :attr name: Response name, used to identify the response
     :attr string: Response string
@@ -229,9 +227,87 @@ class AtCommand(object):
         return string
 
 
+# class AtCommandClientThread(threading.Thread):
+#     """Class for AtCommandClient thread, handles reading and writing to serial port
+#
+#     Attributes
+#
+#     :attr name:
+#     :attr huart:
+#     :attr tx_queue:
+#     :attr rx_queue:
+#     :attr running:
+#
+#     Methods
+#
+#     :method start:
+#     :method run:
+#     :method close:
+#     :method get_tx_message:
+#     :method get_rx_message:
+#
+#     """
+#     def __init__(self, name: str, huart: serial.Serial, tx_queue: queue.Queue, rx_queue: queue.Queue, *args, **kwargs):
+#         super(AtCommandClientThread, self).__init__(*args, **kwargs)
+#         self.setName(name=name)
+#         self.huart = huart
+#         self.tx_queue: queue.Queue = tx_queue
+#         self.rx_queue: queue.Queue = rx_queue
+#         self.running: threading.Event = threading.Event()
+#
+#     def start(self) -> None:
+#         """start the thread"""
+#         self.running.set()
+#         super(AtCommandClientThread, self).start()
+#
+#     def get_tx_message(self) -> str:
+#         """
+#         Get message from tx queue
+#         :return: message from tx queue or an empty string if queue is empty
+#         :rtype: str
+#         """
+#         try:
+#             tx_message = self.tx_queue.get(block=False)
+#         except queue.Empty as e:
+#             tx_message = ""
+#
+#         return tx_message
+#
+#     def get_rx_message(self) -> str:
+#         """
+#         Get message from rx queue
+#         :return: message from tx queue or an empty string if queue is empty
+#         :rtype: str
+#         """
+#         try:
+#             rx_message = self.rx_queue.get(block=False)
+#         except queue.Empty as e:
+#             rx_message = ""
+#
+#         return rx_message
+#
+#     def run(self) -> None:
+#         """run the thread"""
+#         while self.running.is_set():
+#             # send message
+#             tx_message = self.get_tx_message()
+#             if len(tx_message):
+#                 if isinstance(tx_message, str):
+#                     tx_message = bytes(tx_message, "ascii")
+#                 self.huart.write(tx_message)
+#
+#             # receive
+#             read_line = self.huart.readline()
+#             if len(read_line.strip()):
+#                 self.rx_queue.put(read_line.decode("ascii"))
+#
+#     def close(self) -> None:
+#         """Close the thread"""
+#         self.running.clear()
+
+
 class AtCommandClient(object):
-    """At Command Client class, used to send AT commands and receive their
-    responses
+    """At Command Client class, used to send AT commands and receive their responses
 
     Attributes
 
@@ -271,11 +347,13 @@ class AtCommandClient(object):
         self.last_cmd: Optional[AtCommand] = None
         self.last_response: Optional[AtCommandResponse] = None
         self.last_status: Optional[AtCommandStatus] = None
+        self.client_ready: threading.Event = threading.Event()
         self.events: List[AtEvent] = list()
-        self.client_thread = threading.Thread(target=self._run, daemon=False)
-        self.event_lock = threading.RLock()
-        self.running = threading.Event()
-        self.client_ready = threading.Event()
+        self.event_lock: threading.RLock = threading.RLock()
+
+        # client's thread
+        self.client_thread: Optional[threading.Thread] = None
+        self.running: threading.Event = threading.Event()
 
         # set client ready flag
         self.client_ready.set()
@@ -304,7 +382,7 @@ class AtCommandClient(object):
         :rtype: None
         """
 
-        # check if client is client_ready
+        # wait until client is ready
         self.client_ready.wait()
 
         self.logger.debug(f"Sending cmd {cmd.name}: {cmd.cmd.strip()}")
@@ -312,8 +390,8 @@ class AtCommandClient(object):
         # set last command = cmd
         self.last_cmd = cmd
 
-        # clear last response
-        self.last_response = None
+        # clear last status
+        self.last_status = None
 
         # clear last response
         self.last_response = None
@@ -339,7 +417,8 @@ class AtCommandClient(object):
         :rtype: None
         """
         with self.event_lock:
-            self.events.append(event)
+            if event not in self.events:
+                self.events.append(event)
 
     def remove_event(self, event: AtEvent) -> None:
         """
@@ -354,7 +433,7 @@ class AtCommandClient(object):
             try:
                 self.events.remove(event)
             except ValueError as value_err:
-                self.logger.error(f"Can remove event {event} from event list")
+                self.logger.error(f"Can't remove event {event.name} from event list")
 
     def start(self) -> None:
         """
@@ -362,6 +441,7 @@ class AtCommandClient(object):
         :return: None
         :rtype: None
         """
+        self.client_thread = threading.Thread(target=self._run, daemon=False, args=(self.running,))
         self.running.set()
         self.client_ready.set()
         self.client_thread.start()
@@ -372,10 +452,19 @@ class AtCommandClient(object):
         :return: None
         :rtype: None
         """
+
         self.running.clear()
 
-        while self.client_thread.is_alive():
-            time.sleep(0.1)
+        if self.client_thread is None:
+            return
+
+        try:
+            self.client_thread.join(5)
+        except Exception as e:
+            self.logger.error(f"Exception while waiting for {self.name}'ss client thread to close:\n {e}")
+
+        if self.client_thread.is_alive():
+            self.logger.critical(f"Failed to close {self.name}'s client thread")
 
         # issue #11
         # moved after the thread closes, as clearing the event after running event, sometimes happens while the client's
@@ -383,7 +472,7 @@ class AtCommandClient(object):
         # of the last command
         self.client_ready.clear()
 
-    def _run(self) -> None:
+    def _run(self, run: threading.Event) -> None:
         """
         Handles receiving AT commands responses and events, and calling their
         callbacks when needed. Runs in its own thread.
@@ -440,7 +529,7 @@ class AtCommandClient(object):
         response_buffer: str = str()
 
         # while client is running
-        while self.running.is_set():
+        while run.is_set():
 
             # read line from uart
             response_buffer += self.huart.readline().decode("ascii")
@@ -467,8 +556,15 @@ class AtCommandClient(object):
 
                         break
 
+            # ISSUE #12
+            # when closing client from pySIM800, the client thread never joins
+            # and client_thread.is_alive always return true event though
+            # running event is cleared
+            # checking command is not None prevents raising an exception
+            # when calculating timeout time of command if command was None
+            # (start then stop without sending any commands)
             # if no command response is pending, continue
-            if self.client_ready.is_set():
+            if self.last_cmd is None or self.client_ready.is_set():
                 continue
 
             # calculate command timeout
@@ -565,15 +661,15 @@ class AtCommandClient(object):
 if __name__ == '__main__':
     import sys
 
-    log.basicConfig(stream=sys.stdout)
+    log.basicConfig(stream=sys.stdout, level=log.INFO)
 
 
     def is_ready(response: str, string: str) -> None:
-        print(f"Ready callback. String: {repr(string.strip())}")
+        log.info(f"Ready event callback. String: {repr(string.strip())}")
 
 
     def time_update(response: str, string: str) -> None:
-        print(f"Device Date Time Update Callback. String: {repr(string.strip())}")
+        log.info(f"Date Time Update Event Callback. String: {repr(string.strip())}")
 
 
     COM_PORT = "COM6"
@@ -717,7 +813,7 @@ if __name__ == '__main__':
         callback=is_ready
     )
 
-    # ready event
+    # time event
     dt_update = AtEvent(
         name="Date Time Update",
         string="\\+CCLK:\\s*.*\r\n",
@@ -727,59 +823,70 @@ if __name__ == '__main__':
     )
 
     # print responses
-    print(ok_rsp)
-    print(dt_rsp)
-    print(cme_error)
-    print(cms_error)
-    print("-----------------------------")
+    log.debug(ok_rsp)
+    log.debug(dt_rsp)
+    log.debug(cme_error)
+    log.debug(cms_error)
+    log.debug("-----------------------------")
 
-    # print commands
-    print(at_check)
-    print("-----------------------------")
+    # log.debug commands
+    log.debug(at_check)
+    log.debug("-----------------------------")
 
-    print(at_cme)
-    print("-----------------------------")
+    log.debug(at_cme)
+    log.debug("-----------------------------")
 
-    print(at_cms)
-    print("-----------------------------")
+    log.debug(at_cms)
+    log.debug("-----------------------------")
 
-    print(at_dt)
-    print("-----------------------------")
+    log.debug(at_dt)
+    log.debug("-----------------------------")
 
-    print(at_timeout)
-    print("-----------------------------")
+    log.debug(at_timeout)
+    log.debug("-----------------------------")
 
     got_response = threading.Event()
 
 
-    def on_response(
-        cmd: AtCommand,
-        status: AtCommandStatus,
-        response: Optional[AtCommandResponse],
-        response_string: Optional[str]
-    ) -> None:
+    def on_response(cmd: AtCommand,
+                    status: AtCommandStatus,
+                    response: Optional[AtCommandResponse],
+                    response_string: Optional[str]
+                    ) -> None:
+
         global got_response
+
         got_response.set()
-        string = f"Callback for Cmd {cmd.name} status: {status} "
+
+        if status == AtCommandStatus.Timeout:
+            log.error(f"Response for cmd: {repr(cmd.cmd)} timed out")
+
+        elif status == AtCommandStatus.Error:
+            log.error(f"Error response for cmd: {repr(cmd.cmd)}")
+
+        else:
+            log.debug(f"Callback for Cmd {cmd.name} status: {status}")
 
         if response:
-            string += f"Response: {response} "
+            log.debug(f"Response: {repr(response)}")
 
         if response_string:
-            string += f"Response String: {repr(response_string.strip())}"
-
-        print(f"{string}\n")
+            log.debug(f"Response String: {repr(response_string)}")
 
 
     def on_event(event: AtEvent, string: str, response: str) -> None:
-        print(f"Received event: {event.name}, string: {string.strip()}, response: {response.strip()}")
+        log.debug(f"Received event: {event.name}, string: {string.strip()}, response: {response.strip()}")
 
 
     with serial.Serial("COM6", baudrate=115200, timeout=0.1) as ser:
-        cl = AtCommandClient('testClient', ser)
+        cl = AtCommandClient("testClient", ser)
         cl.on_response = on_response
-        cl.start()
 
+        cl.start()
+        time.sleep(1)
+        cl.stop()
+
+        cl.start()
         cl.add_event(ready_event)
         cl.add_event(dt_update)
 
@@ -787,50 +894,50 @@ if __name__ == '__main__':
         got_response.clear()
         cl.send_cmd(at_check)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_cme)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_cms)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_multiline)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_dt)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_timeout)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_prompt)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         got_response.clear()
         cl.send_cmd(at_prompt_err)
         got_response.wait()
-        print(cl)
-        print("-----------------------------")
+        log.debug(cl)
+        log.debug("-----------------------------")
 
         # send events & close
         print("Waiting for events. Press q to close. ")
