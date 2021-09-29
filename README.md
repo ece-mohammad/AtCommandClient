@@ -610,10 +610,10 @@ AtCommandClient.on_reponse(cmd: AtCommand,
 ```
 
 Called by `AtCommandClient`'s thread when a command receives a response, 
-or times out. *Must* be overridden. 
+or times out. *Must* be overridden.
 
 ```python
-AtCommandClient._run() -> None
+AtCommandClient.process_response() -> None
 ```
 
 The main function in `AtCommandClient`'s thread. It reads lines from serial

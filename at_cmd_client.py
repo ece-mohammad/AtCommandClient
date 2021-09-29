@@ -35,13 +35,15 @@
 
 import enum
 import logging as log
+import queue
 import re
 import threading
 import time
 from abc import ABCMeta
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Sequence, Union
 
 import serial
+from serial.tools import list_ports
 
 
 @enum.unique
@@ -180,6 +182,24 @@ class AtEvent(AtString):
         self.event_type = event_type
         self.callback = callback
 
+    @staticmethod
+    def get_event_by_string(event_list: Sequence[object], string: str) -> Optional[object]:
+        """
+        Get first event from event list, where the given string matches the event string
+
+        :param event_list: A sequence of events
+        :type event_list: list, tuple
+        :param string: string used to search for an event from event list
+        :type string: str
+        :return: an event is returned if a match with the string was found, otherwise return None
+        :rtype: AtEvent or None
+        """
+        for event in event_list:
+            assert isinstance(event, AtEvent)
+            if AtString.match_string(event.string, string, event.match_type):
+                return event
+        return None
+
     def __str__(self) -> str:
         return f"AT Event {self.name}\n" \
                f"string: {self.string.strip()}\n" \
@@ -227,83 +247,191 @@ class AtCommand(object):
         return string
 
 
-# class AtCommandClientThread(threading.Thread):
-#     """Class for AtCommandClient thread, handles reading and writing to serial port
-#
-#     Attributes
-#
-#     :attr name:
-#     :attr huart:
-#     :attr tx_queue:
-#     :attr rx_queue:
-#     :attr running:
-#
-#     Methods
-#
-#     :method start:
-#     :method run:
-#     :method close:
-#     :method get_tx_message:
-#     :method get_rx_message:
-#
-#     """
-#     def __init__(self, name: str, huart: serial.Serial, tx_queue: queue.Queue, rx_queue: queue.Queue, *args, **kwargs):
-#         super(AtCommandClientThread, self).__init__(*args, **kwargs)
-#         self.setName(name=name)
-#         self.huart = huart
-#         self.tx_queue: queue.Queue = tx_queue
-#         self.rx_queue: queue.Queue = rx_queue
-#         self.running: threading.Event = threading.Event()
-#
-#     def start(self) -> None:
-#         """start the thread"""
-#         self.running.set()
-#         super(AtCommandClientThread, self).start()
-#
-#     def get_tx_message(self) -> str:
-#         """
-#         Get message from tx queue
-#         :return: message from tx queue or an empty string if queue is empty
-#         :rtype: str
-#         """
-#         try:
-#             tx_message = self.tx_queue.get(block=False)
-#         except queue.Empty as e:
-#             tx_message = ""
-#
-#         return tx_message
-#
-#     def get_rx_message(self) -> str:
-#         """
-#         Get message from rx queue
-#         :return: message from tx queue or an empty string if queue is empty
-#         :rtype: str
-#         """
-#         try:
-#             rx_message = self.rx_queue.get(block=False)
-#         except queue.Empty as e:
-#             rx_message = ""
-#
-#         return rx_message
-#
-#     def run(self) -> None:
-#         """run the thread"""
-#         while self.running.is_set():
-#             # send message
-#             tx_message = self.get_tx_message()
-#             if len(tx_message):
-#                 if isinstance(tx_message, str):
-#                     tx_message = bytes(tx_message, "ascii")
-#                 self.huart.write(tx_message)
-#
-#             # receive
-#             read_line = self.huart.readline()
-#             if len(read_line.strip()):
-#                 self.rx_queue.put(read_line.decode("ascii"))
-#
-#     def close(self) -> None:
-#         """Close the thread"""
-#         self.running.clear()
+class ThreadedSerialHandler(threading.Thread):
+    """
+    A class for handling serial transmission in a separate thread
+
+    Attributes
+
+    :attr name:
+    :attr huart:
+    :attr logger:
+    :attr tx_queue:
+    :attr rx_queue:
+    :attr stop_event:
+
+    Methods
+
+    :method start():
+    :method stop():
+    :method run():
+    :method _send(message):
+    :method receive():
+    :method send_message(message):
+    :method receive_message():
+    :method on_thread_exception:
+    """
+
+    def __init__(self, name: str, port: str, serial_settings: dict, *args, **kwargs):
+
+        # assert serial_settings has timeout
+        assert serial_settings.get("timeout", None)
+
+        super(ThreadedSerialHandler, self).__init__(*args, **kwargs)
+        self.name: str = name
+        self.logger: log.Logger = log.getLogger(f"{self.name}[{self.__class__.__name__}]")
+
+        # serial port
+        self.port: str = port
+        self.serial_settings: dict = serial_settings
+        self.huart: Optional[serial.Serial] = None
+
+        # tx and rx queue
+        self.tx_queue: queue.Queue[bytes] = queue.Queue()
+        self.rx_queue: queue.Queue[bytes] = queue.Queue()
+
+        # serial thread stop_event
+        self.stop_event = threading.Event()
+
+    def start(self) -> None:
+        """
+        start threaded serial handler
+
+        :return: None
+        :rtype: None
+        """
+        self.logger.debug(f"Starting {self.name}({self.__class__.__name__})")
+
+        # open serial port
+        self.huart = serial.Serial()
+        self.huart.setPort(self.port)
+        self.huart.apply_settings(self.serial_settings)
+        self.huart.open()
+
+        # clear serial thread stop_event
+        self.stop_event.clear()
+
+        # initialize serial thread
+        super(ThreadedSerialHandler, self).start()
+
+    def stop(self) -> None:
+        """
+        stop threaded serial handler
+
+        :return: None
+        :rtype: None
+        """
+        self.logger.debug(f"Stopping {self.name}({self.__class__.__name__})")
+
+        # set serial thread stop_event
+        self.stop_event.set()
+
+    def _send(self, message: bytes) -> None:
+        """
+        send message on serial port
+
+        :return: None
+        :rtype: None
+        """
+
+        # check message length
+        if len(message) == 0:
+            return
+
+        # attempt to send message
+        try:
+            self.huart.write(message)
+        except Exception as e:
+            self.logger.error(f"Exception while sending message on serial port:\n{e}")
+
+    def _receive(self) -> bytes:
+        """
+        receive message from serial port
+
+        :return: received message
+        :rtype: bytes
+        """
+
+        try:
+            message = self.huart.readline()
+        except Exception as e:
+            message = bytes()
+            self.logger.error(f"Exception while reading line from serial port:\n{e}")
+
+        return message
+
+    def run(self) -> None:
+        """
+        serial handler thread runner
+
+        :return: None
+        :rtype: None
+        """
+
+        while not self.stop_event.is_set():
+
+            # get message from tx queue
+            try:
+                tx_message = self.tx_queue.get(block=False)
+            except queue.Empty as qe:
+                tx_message = bytes()
+                self.logger.debug(f"TX queue is empty")
+
+            # send message
+            self._send(tx_message)
+
+            # receive message from serial port
+            rx_message = self._receive()
+            if rx_message:
+                self.rx_queue.put(rx_message)
+
+        # close serial port
+        try:
+            self.huart.close()
+        except Exception as e:
+            self.logger.error(f"Exception while trying to close serial port:\n{e}")
+
+    def send_message(self, message: bytes) -> None:
+        """
+        Queues message in serial thread's tx queue to be sent
+
+        :param message: message to be sent
+        :type message: str or bytes
+        :return: None
+        :rtype: None
+        """
+
+        self.tx_queue.put(message)
+
+    def receive_message(self) -> bytes:
+        """
+        Receive message from serial thread rx queue
+
+        :return: message from rx queue
+        :rtype: bytes
+        """
+
+        try:
+            rx_message = self.rx_queue.get(block=False)
+        except queue.Empty as qe:
+            rx_message = bytes()
+            self.logger.debug("RX queue is empty")
+
+        return rx_message
+
+    def on_thread_exception(self, exception: Exception) -> None:
+        """
+        callback to notify parent thread of exceptions caught in Thread.run
+
+        :note: will NOT be called for un handled exceptions
+
+        :param exception: caught exception
+        :type exception: Exception
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.error(f"Caught exception: {exception}")
 
 
 class AtCommandClient(object):
@@ -312,51 +440,69 @@ class AtCommandClient(object):
     Attributes
 
     :attr name: client name, identifies it and is used in logging
-    :attr huart: serial port used to send and receive At commands
     :attr logger: client's logger instance
+    :attr serial_port: serial port used to send and receive At commands
+    :attr serial_settings: serial port settings (baudrate, timeout, data bits, parity, stop bits, etc)
+    :attr serial_handler: serial port handler thread
     :attr last_cmd: last command sent by the client
     :attr last_status: last command status
     :attr last_response: last response received
+    :attr client_not_busy: a flag that indicates if the client is waiting for
+        a response or not (set == not waiting for response, clear == waiting for response)
     :attr events: list of registered events
-    :attr event_lock: a lock on `self.events` to prevent access from multiple
-    threads at the same time
-    :attr running: a flag that indicates if the client is running or not,
-    resetting the flag terminates the client's thread
-    :attr client_ready: a flag that indicates if the client is waiting for
-    a response
-    :attr client_thread: a thread to run the clients `AtCommandClient._run`
-    function, that handles responses and events
+    :attr lock: a lock on `self.events` to prevent access from multiple threads at the same time
+    :attr client_thread: a thread to stop the clients `AtCommandClient.process_response`
+        function, that handles responses and events
+    :attr stop_event: a flag that indicates if the client is stop_event or not,
+        resetting the flag terminates the client's thread
 
     Methods
 
+    :method start: start AtCommandClient's thread
+    :method stop: stop AtCommandClient's thread
+    :method process_response: handles AT commands responses and events, and calls associated callbacks whn needed
     :method send_cmd: send AT command
     :method add_event: add event to current event list
     :method remove_event: remove an event from current event list
-    :method start: start AtCommandClient's thread
-    :method stop: stop AtCommandClient's thread
-    :method on_response: a callback that is called when a command response is
-    received, must be overridden
-    :method _run: handles AT commands responses and events, and calls
-    associated callbacks whn needed
+    :method on_response: a callback that is called when a command response is received, must be overridden
     """
 
-    def __init__(self, name: str, uart_handle: serial.Serial) -> None:
-        self.name = name
-        self.huart = uart_handle
-        self.logger = log.getLogger(f"{self.name}({self.__class__.__name__})")
+    def __init__(self, name: str, serial_port: str, serial_settings: dict) -> None:
+        # check serial port is available
+        assert serial_port in [port.name for port in list_ports.comports()]
+
+        # assert timeout value is present and not zero
+        assert serial_settings.get("timeout", 0)
+
+        self.name: str = name
+        self.logger: log.Logger = log.getLogger(f"{self.name}[{self.__class__.__name__}]")
+
+        # serial port handler
+        self.serial_port: str = serial_port
+        self.serial_settings: dict = serial_settings
+        self.serial_handler: Optional[ThreadedSerialHandler] = None
+
+        # lst AT command, status, response object and received response string
         self.last_cmd: Optional[AtCommand] = None
         self.last_response: Optional[AtCommandResponse] = None
         self.last_status: Optional[AtCommandStatus] = None
-        self.client_ready: threading.Event = threading.Event()
+
+        # client busy event
+        self.client_not_busy: threading.Event = threading.Event()
+
+        # AT events list
         self.events: List[AtEvent] = list()
-        self.event_lock: threading.RLock = threading.RLock()
+
+        # client lock
+        self.lock: threading.RLock = threading.RLock()
 
         # client's thread
         self.client_thread: Optional[threading.Thread] = None
-        self.running: threading.Event = threading.Event()
+        self.stop_event: threading.Event = threading.Event()
 
-        # set client ready flag
-        self.client_ready.set()
+        # lock acquire & release count
+        self.lock_acquired_count: int = 0
+        self.lock_released_count: int = 0
 
     def __str__(self) -> str:
         string = f"Module: {self.name}\n"
@@ -372,110 +518,120 @@ class AtCommandClient(object):
 
         return string
 
-    def send_cmd(self, cmd: AtCommand) -> None:
-        """
-        Send command on UART, blocks until the current command's response
-        is received before sending a new command
-        :param cmd: Command to be sent to GSM module over UART
-        :type cmd: AtCommand
-        :return: None
-        :rtype: None
-        """
-
-        # wait until client is ready
-        self.client_ready.wait()
-
-        self.logger.debug(f"Sending cmd {cmd.name}: {cmd.cmd.strip()}")
-
-        # set last command = cmd
-        self.last_cmd = cmd
-
-        # clear last status
-        self.last_status = None
-
-        # clear last response
-        self.last_response = None
-
-        # send command on serial
-        if isinstance(cmd.cmd, str):
-            self.huart.write(bytes(cmd.cmd, "ascii"))
-        else:
-            self.huart.write(cmd.cmd)
-
-        # command send time
-        cmd.send_time = time.time()
-
-        # clear client_ready
-        self.client_ready.clear()
-
-    def add_event(self, event: AtEvent) -> None:
-        """
-        Adds a new event to event list. Blocks until the event is added.
-        :param event: At event to add
-        :type event: AtEvent
-        :return: None
-        :rtype: None
-        """
-        with self.event_lock:
-            if event not in self.events:
-                self.events.append(event)
-
-    def remove_event(self, event: AtEvent) -> None:
-        """
-        Removes the given event from event list. Blocks until the event is
-        removed
-        :param event: event to remove from event list
-        :type event: AtEvent
-        :return: None
-        :rtype: None
-        """
-        with self.event_lock:
-            try:
-                self.events.remove(event)
-            except ValueError as value_err:
-                self.logger.error(f"Can't remove event {event.name} from event list")
-
     def start(self) -> None:
         """
         Starts the client thread
+
         :return: None
         :rtype: None
         """
-        self.client_thread = threading.Thread(target=self._run, daemon=False, args=(self.running,))
-        self.running.set()
-        self.client_ready.set()
+
+        self.logger.info(f"Starting {self.name}")
+
+        # lock acquire & release count
+        self.lock_acquired_count: int = 0
+        self.lock_released_count: int = 0
+
+        # reset last AT command, response and response buffer
+        self.last_cmd: Optional[AtCommand] = None
+        self.last_response: Optional[AtCommandResponse] = None
+        self.last_status: Optional[AtCommandStatus] = None
+
+        # set client not busy flag
+        self.client_not_busy.set()
+
+        # initialize client thread
+        self.client_thread = threading.Thread(
+            name=f"{self.name}[ClientThread]",
+            target=self.process_response,
+            daemon=False,
+        )
+
+        # initialize serial handler
+        self.serial_handler = ThreadedSerialHandler(
+            name=f"{self.name}(SerialHandler)",
+            port=self.serial_port,
+            serial_settings=self.serial_settings
+        )
+
+        # clear client thread stop event & start client thread
+        self.stop_event.clear()
         self.client_thread.start()
 
-    def stop(self) -> None:
+        # start serial handler thread
+        self.serial_handler.start()
+
+    def _close_client_thread(self) -> None:
         """
-        Stop the AtCommandClient's running thread
+        Close client thread
+
         :return: None
         :rtype: None
         """
 
-        self.running.clear()
+        self.logger.debug(f"Closing client thread")
 
         if self.client_thread is None:
             return
 
+        # set stop event
+        self.stop_event.set()
+
         try:
-            self.client_thread.join(5)
+            self.client_thread.join(1)
         except Exception as e:
             self.logger.error(f"Exception while waiting for {self.name}'ss client thread to close:\n {e}")
 
         if self.client_thread.is_alive():
             self.logger.critical(f"Failed to close {self.name}'s client thread")
 
-        # issue #11
-        # moved after the thread closes, as clearing the event after running event, sometimes happens while the client's
-        # thread has checked running event, but has not yet checked the client_ready event, leading to re-processing
-        # of the last command
-        self.client_ready.clear()
-
-    def _run(self, run: threading.Event) -> None:
+    def _close_serial_handler_thread(self) -> None:
         """
-        Handles receiving AT commands responses and events, and calling their
-        callbacks when needed. Runs in its own thread.
+        Close serial handler thread
+
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.debug(f"Closing serial handler thread")
+
+        if self.serial_handler is None:
+            return
+
+        self.serial_handler.stop()
+
+        try:
+            self.serial_handler.join(1)
+        except Exception as e:
+            self.logger.error(f"Exception while waiting for {self.name}'ss client thread to close:\n {e}")
+
+        if self.serial_handler.is_alive():
+            self.logger.critical(f"Failed to close {self.name}'s client thread")
+
+    def stop(self) -> None:
+        """
+        Stop the AtCommandClient's stop_event thread
+
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.info(f"Stopping {self.name}")
+
+        # stop serial handler thread
+        self._close_serial_handler_thread()
+
+        # stop client thread
+        self._close_client_thread()
+
+        self.logger.info(f"Lock acquired count: {self.lock_acquired_count}")
+        self.logger.info(f"Lock released count: {self.lock_released_count}")
+
+    def process_response(self) -> None:
+        """
+        Handles receiving AT commands responses and events, and calling their callbacks when needed.
+
+        :note: runs in its own thread.
 
         Function breakdown:
 
@@ -528,107 +684,235 @@ class AtCommandClient(object):
         # response buffer
         response_buffer: str = str()
 
-        # while client is running
-        while run.is_set():
+        self.logger.info(f"Starting process_response")
 
-            # read line from uart
-            response_buffer += self.huart.readline().decode("ascii")
+        # while client is stop_event
+        while not self.stop_event.is_set():
 
-            # get events lock
-            with self.event_lock:
+            self.logger.info("Attempting to acquire lock")
 
-                # loop over a copy of added events
-                for event in self.events[:]:
-                    match = AtString.match_string(
-                        event.string,
-                        response_buffer,
-                        event.match_type
+            # get lock
+            with self.lock:
+
+                self.lock_acquired_count += 1
+                self.logger.info("Lock acquired")
+
+                # read message from serial handler
+                received_line = self.serial_handler.receive_message()
+
+                # decode read message
+                try:
+                    received_line = received_line.decode("ascii")
+                except Exception as e:
+                    self.logger.error(f"Exception while decoding received line from urat:\n{e}\n{received_line}")
+                    received_line = b""
+
+                response_buffer += received_line
+
+                # look for an event that matches response buffer
+                event = AtEvent.get_event_by_string(self.events, response_buffer)
+                if event is not None and isinstance(event, AtEvent):
+
+                    # call event callback
+                    event.callback(event.string, response_buffer)
+
+                    # remove event if it's a onetime event
+                    if event.event_type == AtEventType.OneTime:
+                        self.events.remove(event)
+
+                    # clear response buffer
+                    response_buffer = str()
+
+                # ISSUE #12
+                # when closing client from pySIM800, the client thread never joins
+                # and client_thread.is_alive always return true event though
+                # stop_event event is cleared
+                # checking command is not None prevents raising an exception
+                # when calculating timeout time of command if command was None
+                # (start then stop without sending any commands)
+                # if no command response is pending, continue
+                if self.last_cmd is None or self.client_not_busy.is_set():
+                    time.sleep(0.5)
+
+                    self.lock_released_count += 1
+                    self.logger.info("Lock released")
+
+                    continue
+
+                # calculate command timeout
+                timeout_time: float = self.last_cmd.send_time + self.last_cmd.timeout
+
+                # check if command timed out
+                if time.time() > timeout_time:
+                    # command response timed out
+                    self.last_status = AtCommandStatus.Timeout
+                    self.last_response = None
+                    self.on_response(
+                        self.last_cmd,
+                        self.last_status,
+                        self.last_response,
+                        None
                     )
+                    self.last_cmd = None
+                    self.client_not_busy.set()
 
-                    # check for an event match
-                    if match:
-                        event.callback(event.string, match)
-                        response_buffer = str()
+                    self.lock_released_count += 1
+                    self.logger.info("Lock released")
 
-                        # remove one-time events
-                        if event.event_type == AtEventType.OneTime:
-                            self.events.remove(event)
+                    continue
 
-                        break
-
-            # ISSUE #12
-            # when closing client from pySIM800, the client thread never joins
-            # and client_thread.is_alive always return true event though
-            # running event is cleared
-            # checking command is not None prevents raising an exception
-            # when calculating timeout time of command if command was None
-            # (start then stop without sending any commands)
-            # if no command response is pending, continue
-            if self.last_cmd is None or self.client_ready.is_set():
-                continue
-
-            # calculate command timeout
-            timeout_time: float = self.last_cmd.send_time + self.last_cmd.timeout
-
-            # check if command timed out
-            if time.time() > timeout_time:
-                # command response timed out
-                self.last_status = AtCommandStatus.Timeout
-                self.last_response = None
-                self.on_response(
-                    self.last_cmd,
-                    self.last_status,
-                    self.last_response,
-                    None
+                # check success response string was found in response string
+                match = AtString.match_string(
+                    self.last_cmd.success_response.string,
+                    response_buffer,
+                    self.last_cmd.success_response.match_type
                 )
 
-                self.client_ready.set()
-                continue
-
-            # check success response string was found in response string
-            match = AtString.match_string(
-                self.last_cmd.success_response.string,
-                response_buffer,
-                self.last_cmd.success_response.match_type
-            )
-
-            # check if received line matches success response
-            if match:
-                self.last_response = self.last_cmd.success_response
-                self.last_status = AtCommandStatus.Success
-                self.on_response(
-                    self.last_cmd,
-                    self.last_status,
-                    self.last_response,
-                    match
-                )
-
-            # check on of error responses string was found in response string
-            elif self.last_cmd.error_response:
-                for err in self.last_cmd.error_response:
-                    match = AtString.match_string(
-                        err.string,
-                        response_buffer,
-                        err.match_type
+                # check if received line matches success response
+                if match:
+                    self.last_response = self.last_cmd.success_response
+                    self.last_status = AtCommandStatus.Success
+                    self.on_response(
+                        self.last_cmd,
+                        self.last_status,
+                        self.last_response,
+                        match
                     )
 
-                    if match:
-                        self.last_response = err
-                        self.last_status = AtCommandStatus.Error
-                        self.on_response(
-                            self.last_cmd,
-                            self.last_status,
-                            self.last_response,
-                            match
+                # check on of error responses string was found in response string
+                elif self.last_cmd.error_response:
+                    for err in self.last_cmd.error_response:
+                        match = AtString.match_string(
+                            err.string,
+                            response_buffer,
+                            err.match_type
                         )
-                        break
 
-            # reset response buffer & clear client_ready
-            if match:
-                response_buffer = str()
-                self.client_ready.set()
+                        if match:
+                            self.last_response = err
+                            self.last_status = AtCommandStatus.Error
+                            self.on_response(
+                                self.last_cmd,
+                                self.last_status,
+                                self.last_response,
+                                match
+                            )
+                            break
 
-            time.sleep(0.1)
+                # reset response buffer & clear client_not_busy
+                if match:
+                    response_buffer = str()
+                    self.last_cmd = None
+                    self.last_status = None
+                    self.last_response = None
+                    self.client_not_busy.set()
+
+            self.lock_released_count += 1
+            self.logger.info("Lock released")
+
+            time.sleep(0.5)
+
+        self.logger.info(f"Returning from process_response")
+
+    def send_cmd(self, cmd: AtCommand) -> None:
+        """
+        Send command on UART, blocks until the current command's response is received before sending a new command.
+
+        :param cmd: Command to be sent to GSM module over UART
+        :type cmd: AtCommand
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.info("Attempting to acquire lock")
+
+        # acquire lock
+        with self.lock:
+            self.lock_acquired_count += 1
+            self.logger.info("Lock acquired")
+
+            self.logger.info("Waiting client_not_busy")
+
+            # wait until client is not busy
+            self.client_not_busy.wait()
+
+            self.logger.info("Done waiting client_not_busy")
+
+            self.logger.debug(f"Sending cmd {cmd.name}: {repr(cmd.cmd)}")
+
+            # set last command = cmd
+            self.last_cmd = cmd
+
+            # clear last status
+            self.last_status = None
+
+            # clear last response
+            self.last_response = None
+
+            # send command on serial port
+            if isinstance(cmd.cmd, str):
+                cmd.cmd = bytes(cmd.cmd, "ascii")
+
+            self.serial_handler.send_message(cmd.cmd)
+
+            # command send time
+            cmd.send_time = time.time()
+
+            # clear client_not_busy
+            self.client_not_busy.clear()
+
+        self.lock_released_count += 1
+        self.logger.info(f"Lock released")
+
+    def add_event(self, event: AtEvent) -> None:
+        """
+        Adds a new event to event list. Blocks until the event is added.
+
+        :param event: At event to add
+        :type event: AtEvent
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.info("Attempting to acquire lock")
+
+        # acquire lock
+        with self.lock:
+
+            self.lock_acquired_count += 1
+            self.logger.info("Lock acquired")
+
+            if event not in self.events:
+                self.events.append(event)
+
+        self.lock_released_count += 1
+        self.logger.info("Lock released")
+
+    def remove_event(self, event: AtEvent) -> None:
+        """
+        Removes the given event from event list. Blocks until the event is removed
+
+        :param event: event to remove from event list
+        :type event: AtEvent
+        :return: None
+        :rtype: None
+        """
+
+        self.logger.info("Attempting to acquire lock")
+
+        # get lock
+        with self.lock:
+
+            self.lock_acquired_count += 1
+            self.logger.info("Lock acquired")
+
+            try:
+                self.events.remove(event)
+            except Exception as e:
+                self.logger.error(f"Can't remove event {event.name} from event list")
+
+        self.lock_released_count += 1
+        self.logger.info("Lock released")
 
     def on_response(self, cmd: AtCommand,
                     status: AtCommandStatus,
@@ -661,7 +945,18 @@ class AtCommandClient(object):
 if __name__ == '__main__':
     import sys
 
-    log.basicConfig(stream=sys.stdout, level=log.INFO)
+    log.basicConfig(
+        stream=sys.stdout,
+        level=log.INFO,
+        # format="%(levelname)s:%(name)s:%(threadName)s:%(funcName)s:%(lineno)d %(message)s"
+        format="%(levelname)s:%(threadName)s:%(funcName)s:%(lineno)d %(message)s"
+    )
+
+    SERIAL_PORT: str = "COM6"
+    SERIAL_SETTINGS: dict = {
+        "baudrate": 115200,
+        "timeout": 0.1
+    }
 
 
     def is_ready(response: str, string: str) -> None:
@@ -822,28 +1117,28 @@ if __name__ == '__main__':
         callback=time_update
     )
 
-    # print responses
-    log.debug(ok_rsp)
-    log.debug(dt_rsp)
-    log.debug(cme_error)
-    log.debug(cms_error)
-    log.debug("-----------------------------")
-
-    # log.debug commands
-    log.debug(at_check)
-    log.debug("-----------------------------")
-
-    log.debug(at_cme)
-    log.debug("-----------------------------")
-
-    log.debug(at_cms)
-    log.debug("-----------------------------")
-
-    log.debug(at_dt)
-    log.debug("-----------------------------")
-
-    log.debug(at_timeout)
-    log.debug("-----------------------------")
+    # # print responses
+    # log.debug(ok_rsp)
+    # log.debug(dt_rsp)
+    # log.debug(cme_error)
+    # log.debug(cms_error)
+    # log.debug("-----------------------------")
+    #
+    # # log.debug commands
+    # log.debug(at_check)
+    # log.debug("-----------------------------")
+    #
+    # log.debug(at_cme)
+    # log.debug("-----------------------------")
+    #
+    # log.debug(at_cms)
+    # log.debug("-----------------------------")
+    #
+    # log.debug(at_dt)
+    # log.debug("-----------------------------")
+    #
+    # log.debug(at_timeout)
+    # log.debug("-----------------------------")
 
     got_response = threading.Event()
 
@@ -868,7 +1163,7 @@ if __name__ == '__main__':
             log.debug(f"Callback for Cmd {cmd.name} status: {status}")
 
         if response:
-            log.debug(f"Response: {repr(response)}")
+            log.debug(f"Response: {repr(response.string)} matching rule: {response.match_type.name}")
 
         if response_string:
             log.debug(f"Response String: {repr(response_string)}")
@@ -878,70 +1173,89 @@ if __name__ == '__main__':
         log.debug(f"Received event: {event.name}, string: {string.strip()}, response: {response.strip()}")
 
 
-    with serial.Serial("COM6", baudrate=115200, timeout=0.1) as ser:
-        cl = AtCommandClient("testClient", ser)
-        cl.on_response = on_response
+    # initialize client
+    cl = AtCommandClient(
+        name="testClient",
+        serial_port=SERIAL_PORT,
+        serial_settings=SERIAL_SETTINGS
+    )
 
-        cl.start()
-        time.sleep(1)
-        cl.stop()
+    cl.on_response = on_response
 
-        cl.start()
-        cl.add_event(ready_event)
-        cl.add_event(dt_update)
+    cl.add_event(ready_event)
+    cl.add_event(dt_update)
 
-        # send commands
-        got_response.clear()
-        cl.send_cmd(at_check)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    cl.start()
+    time.sleep(1)
+    cl.stop()
 
-        got_response.clear()
-        cl.send_cmd(at_cme)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    # time.sleep(1)
+    # cl.stop()
+    # sys.exit(0)
 
-        got_response.clear()
-        cl.send_cmd(at_cms)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    time.sleep(1)
+    cl.start()
+    time.sleep(1)
+    cl.stop()
 
-        got_response.clear()
-        cl.send_cmd(at_multiline)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    # sys.exit(0)
 
-        got_response.clear()
-        cl.send_cmd(at_dt)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    # send commands
+    cl.start()
+    got_response.clear()
+    cl.send_cmd(at_check)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
 
-        got_response.clear()
-        cl.send_cmd(at_timeout)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    # cl.stop()
+    # sys.exit(0)
 
-        got_response.clear()
-        cl.send_cmd(at_prompt)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    got_response.clear()
+    cl.send_cmd(at_cme)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
 
-        got_response.clear()
-        cl.send_cmd(at_prompt_err)
-        got_response.wait()
-        log.debug(cl)
-        log.debug("-----------------------------")
+    got_response.clear()
+    cl.send_cmd(at_cms)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
 
-        # send events & close
-        print("Waiting for events. Press q to close. ")
-        close = ""
-        while close != 'q':
-            close = input().strip().lower()
-        cl.stop()
+    got_response.clear()
+    cl.send_cmd(at_multiline)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
+
+    got_response.clear()
+    cl.send_cmd(at_dt)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
+
+    got_response.clear()
+    cl.send_cmd(at_timeout)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
+
+    got_response.clear()
+    cl.send_cmd(at_prompt)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
+
+    got_response.clear()
+    cl.send_cmd(at_prompt_err)
+    got_response.wait()
+    # log.debug(cl)
+    log.debug("-----------------------------")
+
+    # send events & close
+    log.critical("Waiting for events. Press q to close. ")
+    close = ""
+    while close != 'q':
+        close = input().strip().lower()
+    cl.stop()

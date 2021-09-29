@@ -2,18 +2,20 @@
 # -*- coding: utf-8 -*-
 
 
+import threading
 from unittest import TestCase
-import sys
-import serial
-from serial import Serial
-from at_cmd_client import AtStringMatchingRule, AtCommand, AtCommandResponse, AtCommandClient, AtCommandStatus
+from unittest.mock import Mock
+
+from at_cmd_client import AtCommand, AtCommandClient, AtCommandResponse, AtCommandStatus, AtStringMatchingRule
 
 
 class Test(TestCase):
-
     # serial port
     SERIAL_PORT = "COM6"
-    SERIAL_BR = 115200
+    SERIAL_SETTINGS = {
+        "baudrate": 115200,
+        "timeout":  0.1
+    }
 
     # ok response
     OK_RSP = AtCommandResponse(
@@ -88,13 +90,173 @@ class Test(TestCase):
         timeout=3
     )
 
-    def test_at_client_send_command(self) -> None:
-        with serial.Serial(port=self.SERIAL_PORT, baudrate=self.SERIAL_BR) as serial_port:
-            client = AtCommandClient(name=__name__, uart_handle=serial_port)
-            status = client.send_cmd(self.AT_CHECK)
-            self.assertEqual(status, AtCommandStatus.Success, f"AT Command {self.AT_CHECK} status: {status}")
-            self.assertIn(self.AT_CHECK.success_response.string, client.response_buffer.decode("ascii"))
+    @staticmethod
+    def client_on_at_command_response(cmd: AtCommand,
+                                      status: AtCommandStatus,
+                                      response: AtCommandResponse,
+                                      response_buffer: str
+                                      ) -> None:
+        print(f"Received response for command: {cmd.name} with status: {status}")
+
+    def client_initialized(self, client: AtCommandClient) -> None:
+        """Test AtCommandClient object attributes values after initialization"""
+
+        # client instance is AtCommandClient
+        self.assertTrue(isinstance(client, AtCommandClient))
+
+        # client name is not empty
+        self.assertTrue(len(client.name.strip()) > 0)
+
+        # serial handler thread is None @ initialization
+        self.assertIsNone(client.serial_handler)
+
+        # last command, last response & last status are None
+        self.assertIsNone(client.last_cmd)
+        self.assertIsNone(client.last_status)
+        self.assertIsNone(client.last_response)
+
+        # client not busy event is clear
+        self.assertFalse(client.client_not_busy.is_set())
+
+        # client thread is None @ initialization
+        self.assertIsNone(client.client_thread)
+
+        # client thread stop event is clear
+        self.assertFalse(client.stop_event.is_set())
+
+        # active thread count == 1
+        self.assertEqual(threading.active_count(), 1)
+
+    def client_started(self, client: AtCommandClient) -> None:
+        """Test AtCommandClient object attributes after calling start"""
+
+        # client not busy flag is set
+        self.assertTrue(client.client_not_busy.is_set())
+
+        # client thread stop event is clear
+        self.assertFalse(client.stop_event.is_set())
+
+        # client thread is not None
+        self.assertIsNotNone(client.client_thread)
+
+        # client thread is alive
+        self.assertTrue(client.client_thread.is_alive())
+
+        # serial handler thread is not none
+        self.assertIsNotNone(client.serial_handler)
+
+        # serial handler thread is alive
+        self.assertTrue(client.serial_handler.is_alive())
+
+        # serial port is open
+        self.assertTrue(client.serial_handler.huart.isOpen())
+
+        # active thread count == 3
+        self.assertEqual(3, threading.active_count())
+
+    def client_stopped(self, client: AtCommandClient) -> None:
+        """Test AtCommandClient attribute values after stop"""
+
+        # client stop event is set
+        self.assertTrue(client.stop_event.is_set())
+
+        # client thread is not alive
+        self.assertFalse(client.client_thread.is_alive())
+
+        # serial handler thread is not alive
+        self.assertFalse(client.serial_handler.is_alive())
+
+        # serial port is closed
+        self.assertFalse(client.serial_handler.huart.isOpen())
+
+        # active thread count == 1
+        self.assertEqual(1, threading.active_count())
+
+    def test_at_client_init(self) -> None:
+        """Test ATCommandClient after initialization"""
+
+        client = AtCommandClient(
+            "TestAtClient",
+            serial_port=self.SERIAL_PORT,
+            serial_settings=self.SERIAL_SETTINGS
+        )
+
+        client.on_response = self.client_on_at_command_response
+
+        self.client_initialized(client)
+
+    def test_at_client_init_bad_serial_timeout(self) -> None:
+        """Test ATCommandClient after initialization"""
+
+        bad_config = {
+            "baudrate": 115200,
+        }
+
+        self.assertRaises(Exception, lambda: AtCommandClient("badClient", self.SERIAL_PORT, bad_config))
+
+    def test_at_client_init_bad_serial_port(self) -> None:
+        """Test ATCommandClient after initialization"""
+
+        self.assertRaises(Exception, lambda: AtCommandClient("badClient", "BAD_PORT", self.SERIAL_SETTINGS))
+
+    def test_at_client_start_stop(self) -> None:
+        """Test AtCommandClient start & stop"""
+
+        client = AtCommandClient(
+            "TestAtClient",
+            serial_port=self.SERIAL_PORT,
+            serial_settings=self.SERIAL_SETTINGS
+        )
+
+        client.on_response = self.client_on_at_command_response
+
+        # start client
+        client.start()
+        self.client_started(client)
+
+        # stop client
+        client.stop()
+        self.client_stopped(client)
+
+    def test_at_client_start_stop_restart_stop(self) -> None:
+        """Test AtCommandClient start & stop then start & stop"""
+
+        client = AtCommandClient(
+            "TestAtClient",
+            serial_port=self.SERIAL_PORT,
+            serial_settings=self.SERIAL_SETTINGS
+        )
+
+        client.on_response = self.client_on_at_command_response
+
+        # start client
+        client.start()
+        self.client_started(client)
+
+        # stop client
+        client.stop()
+        self.client_stopped(client)
+
+        # start client again
+        client.start()
+        self.client_started(client)
+
+        # stop client
+        client.stop()
+        self.client_stopped(client)
+
+    def test_at_client_send_command_with_success_response(self) -> None:
+        pass
+
+    def test_at_client_send_command_with_error_response(self) -> None:
+        pass
+
+    def test_at_client_send_command_with_timeout_response(self) -> None:
+        pass
 
 
 if __name__ == '__main__':
-    pass
+    import sys
+    import logging as log
+
+    log.basicConfig(level=log.INFO, stream=sys.stderr)
